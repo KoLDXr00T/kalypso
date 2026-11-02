@@ -20,6 +20,7 @@ use ts_rs::TS;
 
 use crate::error::{KalypsoError, Result};
 use crate::store::Db;
+use crate::vault::Vault;
 
 /// How long a call waits for the user before it is denied.
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
@@ -56,6 +57,13 @@ pub enum Spec {
     },
     /// Plain language only; checked by the judge (#30), not here.
     Text,
+}
+
+/// LLM provider format used by the text-policy judge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JudgeFormat {
+    Anthropic,
+    OpenAi,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
@@ -285,13 +293,17 @@ fn check_spec(spec: &Spec, call: &ToolCall, secrets: &[String]) -> Option<String
     }
 }
 
-/// Every enabled policy that stops `call`, block first, then approve, then warn.
-pub fn evaluate(policies: &[Policy], call: &ToolCall, secrets: &[String]) -> Vec<Hit> {
-    let rank = |e: &str| match e {
+/// Sort order of an enforcement: block before approve before warn.
+pub fn rank(enforcement: &str) -> u8 {
+    match enforcement {
         "block" => 0,
         "approve" => 1,
         _ => 2,
-    };
+    }
+}
+
+/// Every enabled policy that stops `call`, block first, then approve, then warn.
+pub fn evaluate(policies: &[Policy], call: &ToolCall, secrets: &[String]) -> Vec<Hit> {
     let mut hits: Vec<Hit> = policies
         .iter()
         .filter(|p| p.enabled)
@@ -299,6 +311,70 @@ pub fn evaluate(policies: &[Policy], call: &ToolCall, secrets: &[String]) -> Vec
         .collect();
     hits.sort_by_key(|h| rank(&h.policy.enforcement));
     hits
+}
+
+/// How long the judge may take. Past this the rule counts as tripped (fails closed).
+pub const JUDGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Find an LLM provider configured in the namespace: ANTHROPIC_* or OPENAI_*.
+/// Returns (base_url, api_key, format) or None if none is configured.
+pub fn find_llm_config(db: &Db, vault: &Vault, ns: &str) -> Result<Option<(String, String, JudgeFormat)>> {
+    if let Some(key) = vault.lookup(db, ns, "ANTHROPIC_API_KEY")? {
+        let base = vault.lookup(db, ns, "ANTHROPIC_BASE_URL")?.unwrap_or_else(|| "https://api.anthropic.com".into());
+        return Ok(Some((base, key, JudgeFormat::Anthropic)));
+    }
+    if let Some(key) = vault.lookup(db, ns, "OPENAI_API_KEY")? {
+        let base = vault.lookup(db, ns, "OPENAI_BASE_URL")?.unwrap_or_else(|| "https://api.openai.com/v1".into());
+        return Ok(Some((base, key, JudgeFormat::OpenAi)));
+    }
+    Ok(None)
+}
+
+/// Ask a small model whether `call` breaks the plain-language `rule`.
+/// `Ok(Some(reason))` if it does, `Ok(None)` if not. Any failure (unreachable, timeout,
+/// error status, unexpected reply) is an `Err`: the caller must treat it as tripped.
+pub async fn judge_text(
+    rule: &str,
+    call: &ToolCall,
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    format: JudgeFormat,
+) -> Result<Option<String>> {
+    let fail = |what: &str, e: &dyn std::fmt::Display| KalypsoError::Runtime(format!("policy judge {what}: {e}"));
+    let call_json = serde_json::to_string(call).map_err(|e| fail("could not encode the call", &e))?;
+    let prompt = format!(
+        "You are a policy judge. Decide if the tool call violates the policy rule.\n\nPolicy rule: {rule}\n\nTool call: {call_json}\n\nReply with exactly one line: ALLOW or DENY: <reason>."
+    );
+    let messages = serde_json::json!([{"role": "user", "content": prompt}]);
+    let req = match format {
+        JudgeFormat::Anthropic => http
+            .post(format!("{base_url}/v1/messages"))
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&serde_json::json!({"model": "claude-haiku-5-5", "max_tokens": 100, "messages": messages})),
+        // OPENAI_BASE_URL already ends in /v1, as for the gateway's routes.
+        JudgeFormat::OpenAi => http
+            .post(format!("{base_url}/chat/completions"))
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({"model": "gpt-4.1-mini", "max_tokens": 100, "messages": messages})),
+    };
+    let resp = req.timeout(JUDGE_TIMEOUT).send().await.map_err(|e| fail("unreachable", &e))?;
+    let resp = resp.error_for_status().map_err(|e| fail("returned an error", &e))?;
+    let v: serde_json::Value = resp.json().await.map_err(|e| fail("sent a bad response", &e))?;
+    let pointer = match format {
+        JudgeFormat::Anthropic => "/content/0/text",
+        JudgeFormat::OpenAi => "/choices/0/message/content",
+    };
+    let text = v.pointer(pointer).and_then(|t| t.as_str()).unwrap_or_default();
+    let line = text.trim().lines().next().unwrap_or_default().trim();
+    if line == "ALLOW" {
+        Ok(None)
+    } else if let Some(reason) = line.strip_prefix("DENY:") {
+        Ok(Some(reason.trim().to_string()))
+    } else {
+        Err(fail("gave an unexpected reply", &line))
+    }
 }
 
 /// One line describing the call for logs and approval prompts, with secret values hidden.
@@ -638,6 +714,7 @@ impl Approvals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
 
     fn db() -> Db {
         let db = Db::open_in_memory().unwrap();
@@ -825,5 +902,107 @@ mod tests {
 
         assert_eq!(a.ask(req("two"), Duration::from_millis(30)).await, Answer::TimedOut);
         assert!(a.pending("work").is_empty());
+    }
+    /// No LLM configured → None.
+    #[test]
+    fn find_llm_config_none_when_unconfigured() {
+        let db = db();
+        let vault = Vault::ephemeral();
+        assert!(find_llm_config(&db, &vault, "work").unwrap().is_none());
+    }
+
+    /// ANTHROPIC_API_KEY → Anthropic format with default base URL.
+    #[test]
+    fn find_llm_config_anthropic() {
+        let db = db();
+        let vault = Vault::ephemeral();
+        vault.create_ns_key(&db, "work").unwrap();
+        vault.set(&db, "work", "ANTHROPIC_API_KEY", "sk-ant-test", "gateway").unwrap();
+        let (base, key, fmt) = find_llm_config(&db, &vault, "work").unwrap().unwrap();
+        assert_eq!(base, "https://api.anthropic.com");
+        assert_eq!(key, "sk-ant-test");
+        assert_eq!(fmt, JudgeFormat::Anthropic);
+    }
+
+    /// OPENAI_API_KEY → OpenAI format with default base URL.
+    #[test]
+    fn find_llm_config_openai() {
+        let db = db();
+        let vault = Vault::ephemeral();
+        vault.create_ns_key(&db, "work").unwrap();
+        vault.set(&db, "work", "OPENAI_API_KEY", "sk-openai-test", "gateway").unwrap();
+        let (base, key, fmt) = find_llm_config(&db, &vault, "work").unwrap().unwrap();
+        assert_eq!(base, "https://api.openai.com/v1");
+        assert_eq!(key, "sk-openai-test");
+        assert_eq!(fmt, JudgeFormat::OpenAi);
+    }
+
+    /// Anthropic base URL override is honored.
+    #[test]
+    fn find_llm_config_anthropic_base_url_override() {
+        let db = db();
+        let vault = Vault::ephemeral();
+        vault.create_ns_key(&db, "work").unwrap();
+        vault.set(&db, "work", "ANTHROPIC_API_KEY", "sk-ant-test", "gateway").unwrap();
+        vault.set(&db, "work", "ANTHROPIC_BASE_URL", "https://proxy.example.com", "gateway").unwrap();
+        let (base, _, _) = find_llm_config(&db, &vault, "work").unwrap().unwrap();
+        assert_eq!(base, "https://proxy.example.com");
+    }
+
+    /// A fake provider that answers like the real APIs, including rejecting
+    /// Anthropic calls without `anthropic-version`.
+    async fn fake_judge() -> String {
+        fn verdict(body: &serde_json::Value) -> &'static str {
+            let prompt = body.pointer("/messages/0/content").and_then(|c| c.as_str()).unwrap_or_default();
+            if prompt.contains("DROP") {
+                "DENY: dropping tables is not allowed"
+            } else {
+                "ALLOW"
+            }
+        }
+        let app = axum::Router::new()
+            .route(
+                "/v1/messages",
+                axum::routing::post(|headers: axum::http::HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    if headers.get("anthropic-version").is_none() {
+                        return axum::http::StatusCode::BAD_REQUEST.into_response();
+                    }
+                    axum::Json(serde_json::json!({"content": [{"type": "text", "text": verdict(&body)}]})).into_response()
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    axum::Json(serde_json::json!({"choices": [{"message": {"content": verdict(&body)}}]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    /// Both provider formats reach the right endpoint and are parsed.
+    #[tokio::test]
+    async fn judge_text_speaks_anthropic_and_openai() {
+        let url = fake_judge().await;
+        let http = reqwest::Client::new();
+        let bash = |c: &str| ToolCall { kind: "bash".into(), command: Some(c.into()), ..Default::default() };
+        let rule = "Never drop database tables.";
+        for (base, format) in [(url.clone(), JudgeFormat::Anthropic), (format!("{url}/v1"), JudgeFormat::OpenAi)] {
+            let denied = judge_text(rule, &bash("DROP TABLE users"), &http, &base, "sk-test", format).await.unwrap();
+            assert_eq!(denied.as_deref(), Some("dropping tables is not allowed"), "{format:?}");
+            let allowed = judge_text(rule, &bash("echo hello"), &http, &base, "sk-test", format).await.unwrap();
+            assert_eq!(allowed, None, "{format:?}");
+        }
+    }
+
+    /// An unreachable judge is an error, never a silent allow.
+    #[tokio::test]
+    async fn judge_text_errors_when_unreachable() {
+        let call = ToolCall { kind: "bash".into(), command: Some("echo hello".into()), ..Default::default() };
+        let r =
+            judge_text("Never drop tables.", &call, &reqwest::Client::new(), "http://127.0.0.1:1", "sk-test", JudgeFormat::Anthropic).await;
+        assert!(r.is_err());
     }
 }
