@@ -28,8 +28,8 @@ async fn fake(State(seen): State<Upstream>, req: Request) -> Response {
     let stream = body["stream"].as_bool().unwrap_or(false);
     let path = parts.uri.path().to_string();
     let prompt = body.pointer("/messages/0/content").and_then(|c| c.as_str()).unwrap_or_default();
-    let judge_verdict =
-        prompt.starts_with("You are a policy judge").then(|| if prompt.contains("DROP") { "DENY: dropping tables" } else { "ALLOW" });
+    let is_judge = body["system"].as_str().is_some_and(|s| s.starts_with("You are a security policy judge"));
+    let judge_verdict = is_judge.then(|| if prompt.contains("DROP") { "DENY: dropping tables" } else { "ALLOW" });
     *seen.lock().unwrap() = Seen {
         path: path.clone(),
         headers: parts.headers.iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string())).collect(),
